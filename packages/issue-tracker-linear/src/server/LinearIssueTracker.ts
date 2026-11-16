@@ -392,6 +392,11 @@ export const make: Effect.Effect<StandaloneIssueTrackerApi, never, LinearApi.Lin
           input.query === undefined
             ? null
             : /^(?:[A-Za-z][A-Za-z0-9]*-|#)?(\d+)$/.exec(input.query.trim());
+        // Each is its own clause: an assignee filter must narrow "assigned to me", not replace it.
+        const clauses: LinearApi.IssueFilter[] = [
+          ...(input.assignee === undefined ? [] : [{ assignee: { id: { eq: input.assignee } } }]),
+          ...(input.labels ?? []).map((name) => ({ labels: { some: { name: { eq: name } } } })),
+        ];
         const filter: LinearApi.IssueFilter = {
           team: { key: { eq: input.scope.trim().toUpperCase() } },
           ...involvementFilter(input),
@@ -405,6 +410,7 @@ export const make: Effect.Effect<StandaloneIssueTrackerApi, never, LinearApi.Lin
                       : { nin: CLOSED_STATE_TYPES },
                 },
               }),
+          ...(clauses.length === 0 ? {} : { and: clauses }),
           ...(input.query === undefined
             ? {}
             : {
@@ -415,12 +421,19 @@ export const make: Effect.Effect<StandaloneIssueTrackerApi, never, LinearApi.Lin
                 ],
               }),
         };
-        return linear.listIssues({ filter, first: input.limit, after: input.cursor }).pipe(
-          Effect.map((page) => ({
-            items: page.nodes.map(toSummary),
-            nextCursor: page.nextCursor,
-          })),
-        );
+        return linear
+          .listIssues({
+            filter,
+            first: input.limit,
+            after: input.cursor,
+            orderBy: input.sort === "created" ? "createdAt" : "updatedAt",
+          })
+          .pipe(
+            Effect.map((page) => ({
+              items: page.nodes.map((node) => toSummary(node)),
+              nextCursor: page.nextCursor,
+            })),
+          );
       },
 
       getIssue: Effect.fn("LinearIssueTracker.getIssue")(function* (input) {
@@ -516,12 +529,20 @@ export const make: Effect.Effect<StandaloneIssueTrackerApi, never, LinearApi.Lin
         const emoji = EMOJI_BY_CONTENT[input.content];
         const target =
           input.subjectId === undefined ? { issueId: issue.id } : { commentId: input.subjectId };
-        if (input.reacted) {
+        // Comment ids are global: prove the comment belongs to this issue before writing.
+        const subject =
+          input.subjectId === undefined && input.reacted
+            ? null
+            : yield* linear.listReactions(target);
+        if (subject !== null && subject.issueId !== issue.id) {
+          return yield* failed("setReaction", "The comment does not belong to the selected issue.");
+        }
+        if (subject === null || input.reacted) {
           yield* linear.createReaction({ ...target, emoji });
           return;
         }
         const viewer = yield* viewerId;
-        const reactions = yield* linear.listReactions(target);
+        const { reactions } = subject;
         const own = reactions.find(
           (reaction) => reaction.emoji === emoji && reaction.user?.id === viewer,
         );

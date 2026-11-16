@@ -260,5 +260,17 @@ describe("Azure DevOps issue scope", () => {
       definition.issueScope?.({ provider: kind, displayName: "acme/Web%20App/_git/web" }),
     ).toBe("acme/Web App");
     expect(definition.issueScope?.({ provider: kind, displayName: "web" })).toBeNull();
+    // A legacy remote keeps the organization in its host, and so does its work item URL.
+    expect(definition.issueScope?.({ provider: kind, displayName: "Web%20App/_git/web" })).toBe(
+      "Web App",
+    );
+    expect(
+      definition.parseIssueUrl?.(
+        new URL("https://acme.visualstudio.com/Web%20App/_workitems/edit/9"),
+      ),
+    ).toEqual({ host: "acme.visualstudio.com", scope: "web app", key: "9" });
+    expect(
+      definition.parseIssueUrl?.(new URL("https://dev.azure.com/acme/_workitems/edit/9")),
+    ).toBeNull();
   });
 });

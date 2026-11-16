@@ -78,19 +78,22 @@ function fakeLinear(
         const operation = /^(?:query|mutation) (\w+)/.exec(parsed.query)?.[1] ?? "?";
         requests.push({ authorization: request.headers.authorization, operation });
         const answer = answers[operation];
+        const answered = answer?.(parsed.variables);
         const response =
-          answer === undefined
-            ? new Response(
-                JSON.stringify({ errors: [{ message: `No answer for ${operation}` }] }),
-                {
-                  status: 400,
+          answered instanceof Response
+            ? answered
+            : answer === undefined
+              ? new Response(
+                  JSON.stringify({ errors: [{ message: `No answer for ${operation}` }] }),
+                  {
+                    status: 400,
+                    headers: { "content-type": "application/json" },
+                  },
+                )
+              : new Response(JSON.stringify({ data: answered }), {
+                  status: 200,
                   headers: { "content-type": "application/json" },
-                },
-              )
-            : new Response(JSON.stringify({ data: answer(parsed.variables) }), {
-                status: 200,
-                headers: { "content-type": "application/json" },
-              });
+                });
         return HttpClientResponse.fromWeb(request, response);
       }),
     ),
@@ -120,8 +123,14 @@ describe("LinearIssueTracker", () => {
           expect(variables.filter).toMatchObject({
             team: { key: { eq: "ENG" } },
             state: { type: { nin: ["completed", "canceled"] } },
+            // "Assigned to me" survives an assignee filter: both must hold.
             assignee: { id: { eq: "usr_julius" } },
+            and: [
+              { assignee: { id: { eq: "usr_theo" } } },
+              { labels: { some: { name: { eq: "Bug" } } } },
+            ],
           });
+          expect(variables.orderBy).toBe("createdAt");
           return {
             issues: {
               nodes: [
@@ -145,6 +154,9 @@ describe("LinearIssueTracker", () => {
         state: "open",
         involvement: "assigned",
         viewer: "usr_julius",
+        labels: ["Bug"],
+        assignee: "usr_theo",
+        sort: "created",
         limit: 50,
       });
       expect(page.nextCursor).toBe("cur_2");
@@ -152,6 +164,8 @@ describe("LinearIssueTracker", () => {
         ["ENG-2", "ENG-2", { category: "closed", name: "Done", closeReason: "completed" }],
         ["ENG-1", "ENG-1", { category: "open", name: "In Progress" }],
       ]);
+      // A listing carries no comment totals, whatever the row's position.
+      expect(page.items.map((item) => item.commentCount)).toEqual([0, 0]);
       expect(page.items[0]).toMatchObject({
         closedAt: "2026-07-03T00:00:00.000Z",
         author: { login: "usr_julius", name: "julius" },
@@ -160,6 +174,69 @@ describe("LinearIssueTracker", () => {
       });
       // The stored key goes in as-is, not as a bearer token.
       expect(requests.map((request) => request.authorization)).toEqual(["lin_api_stored"]);
+
+      // Linear's reset header is an absolute time in epoch milliseconds.
+      const resetAt = 4_102_444_800_000;
+      const limited = fakeLinear({
+        T3Issues: () =>
+          new Response(JSON.stringify({ errors: [{ message: "Rate limited" }] }), {
+            status: 429,
+            headers: {
+              "content-type": "application/json",
+              "x-ratelimit-requests-reset": String(resetAt),
+            },
+          }),
+      });
+      const refused = yield* Effect.flip(
+        (yield* limited.tracker).listIssues({
+          ...target,
+          state: "open",
+          involvement: "all",
+          viewer: "usr_julius",
+          sort: "updated",
+          limit: 50,
+        }),
+      );
+      expect([refused.reason, refused.retryAt]).toEqual(["rate-limited", resetAt]);
+    }),
+  );
+
+  it.effect("reacts to a comment only when it belongs to the issue named", () =>
+    Effect.gen(function* () {
+      const created: Array<unknown> = [];
+      const deleted: Array<unknown> = [];
+      const { tracker } = fakeLinear({
+        T3Viewer: () => ({ viewer: JULIUS, teams: { nodes: [] } }),
+        T3Issue: (variables) => ({ issue: bareDetail(String(variables.id)) }),
+        T3CommentReactions: (variables) => ({
+          comment: {
+            issue: { id: variables.id === "cmt_own" ? "iss_ENG-1" : "iss_OPS-9" },
+            reactions: [{ id: "r1", emoji: "👍", user: JULIUS }],
+          },
+        }),
+        T3ReactionCreate: (variables) => {
+          created.push(variables.input);
+          return { reactionCreate: { success: true } };
+        },
+        T3ReactionDelete: (variables) => {
+          deleted.push(variables.id);
+          return { reactionDelete: { success: true } };
+        },
+      });
+      const api = yield* tracker;
+      const reaction = { ...target, key: "ENG-1", content: "thumbs-up" as const };
+      for (const reacted of [true, false]) {
+        const foreign = yield* Effect.flip(
+          api.setReaction({ ...reaction, subjectId: "cmt_other", reacted }),
+        );
+        expect(foreign.detail).toBe("The comment does not belong to the selected issue.");
+      }
+      expect([created, deleted]).toEqual([[], []]);
+
+      yield* api.setReaction({ ...reaction, subjectId: "cmt_own", reacted: true });
+      yield* api.setReaction({ ...reaction, subjectId: "cmt_own", reacted: false });
+      expect(created).toEqual([{ commentId: "cmt_own", emoji: "👍" }]);
+      expect(deleted).toEqual(["r1"]);
     }),
   );
 
